@@ -1,4 +1,4 @@
-#excel and table detection code 
+# excel and table detection code
 
 import re
 import logging
@@ -26,13 +26,30 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
+
+
 def detect_numeric_columns(df: pd.DataFrame, sample_size: int = 3) -> List[str]:
+    """
+    Detects columns that can be treated as numeric.
+
+    The function checks a small sample of non-empty values from each column,
+    removes common formatting symbols such as commas, currency symbols, and
+    percentages, then tests whether most sampled values can be converted to float.
+
+    Args:
+        df (pd.DataFrame): DataFrame whose columns need to be checked.
+        sample_size (int): Number of non-empty values to sample from each column.
+
+    Returns:
+        List[str]: Column names that appear to contain numeric values.
+    """
     numeric_cols = []
 
     for col in df.columns:
@@ -69,7 +86,24 @@ def detect_numeric_columns(df: pd.DataFrame, sample_size: int = 3) -> List[str]:
             numeric_cols.append(col)
 
     return numeric_cols
+
+
 def _analyze_cell_formatting(sheet: Worksheet, row: int, col: int) -> Dict[str, Any]:
+    """
+    Reads formatting signals from a single Excel cell.
+
+    This helper checks whether a cell has borders, bold text, fill color,
+    merged-cell status, alignment, font size, and value type. These signals are
+    later used to identify formatted table headers and table regions.
+
+    Args:
+        sheet (Worksheet): OpenPyXL worksheet to inspect.
+        row (int): One-based row number of the target cell.
+        col (int): One-based column number of the target cell.
+
+    Returns:
+        Dict[str, Any]: Formatting metadata for the selected cell.
+    """
     cell = sheet.cell(row=row, column=col)
     fmt: Dict[str, Any] = {
         "has_border": False,
@@ -107,6 +141,20 @@ def _analyze_cell_formatting(sheet: Worksheet, row: int, col: int) -> Dict[str, 
 
 
 def _build_merge_map(sheet_format: Worksheet, sheet_values: Worksheet) -> Dict[Tuple[int, int], Any]:
+    """
+    Builds a lookup map for merged-cell values.
+
+    For every merged range in the formatted worksheet, this function maps each
+    cell inside the merged range to the top-left value from the values worksheet.
+    This helps preserve header or data values that visually span multiple cells.
+
+    Args:
+        sheet_format (Worksheet): Worksheet loaded with formulas and formatting.
+        sheet_values (Worksheet): Worksheet loaded with calculated values.
+
+    Returns:
+        Dict[Tuple[int, int], Any]: Mapping from cell coordinates to merged values.
+    """
     merge_map: Dict[Tuple[int, int], Any] = {}
     for merged_range in sheet_format.merged_cells.ranges:
         top_left_val = sheet_values.cell(
@@ -125,6 +173,23 @@ def _find_formatted_table_boundary(
     start_col: int,
     processed_cells: set,
 ) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Finds the rectangular boundary of a formatted table.
+
+    Starting from a likely header cell, this function expands left and right to
+    locate the header width, then scans downward until the data region ends.
+
+    Args:
+        sheet (Worksheet): Worksheet being analyzed.
+        format_grid (Dict): Formatting metadata for non-empty cells.
+        start_row (int): Candidate header row.
+        start_col (int): Candidate header column.
+        processed_cells (set): Cells already assigned to previously detected tables.
+
+    Returns:
+        Optional[Tuple[int, int, int, int]]: Table region as
+        (start_row, end_row, start_col, end_col), or None if no valid table is found.
+    """
     max_row = sheet.max_row
     max_col = sheet.max_column
 
@@ -172,6 +237,22 @@ def _detect_formatted_table_regions(
     min_rows: int = 3,
     min_cols: int = 3,
 ) -> List[Tuple[int, int, int, int]]:
+    """
+    Detects table-like regions using Excel formatting cues.
+
+    The function scans non-empty cells, identifies possible header cells based on
+    formatting such as borders, bold text, fills, or merged cells, and then expands
+    each candidate into a rectangular table boundary.
+
+    Args:
+        sheet (Worksheet): Worksheet to inspect.
+        min_rows (int): Minimum number of rows required for a valid table.
+        min_cols (int): Minimum number of columns required for a valid table.
+
+    Returns:
+        List[Tuple[int, int, int, int]]: Detected table regions as
+        (start_row, end_row, start_col, end_col).
+    """
     max_row = sheet.max_row
     max_col = sheet.max_column
     if max_row == 1 and max_col == 1:
@@ -210,6 +291,15 @@ def _detect_formatted_table_regions(
 
 
 def _col_letter(col_idx: int) -> str:
+    """
+    Converts a zero-based column index into an Excel column letter.
+
+    Args:
+        col_idx (int): Zero-based column index.
+
+    Returns:
+        str: Excel-style column label, such as A, B, Z, AA, or AB.
+    """
     if col_idx < 0:
         col_idx = 0
     result = ""
@@ -225,6 +315,21 @@ def _detect_tables_in_sheet_values(
     min_rows: int = 3,
     min_cols: int = 2,
 ) -> List[str]:
+    """
+    Detects table ranges from raw worksheet values.
+
+    This fallback method identifies consecutive row blocks where each row has at
+    least a minimum number of non-empty cells, then converts those blocks into
+    Excel-style ranges.
+
+    Args:
+        sheet_data (List[List]): Raw worksheet values as a list of rows.
+        min_rows (int): Minimum number of rows required for a detected table.
+        min_cols (int): Minimum number of non-empty cells required per row.
+
+    Returns:
+        List[str]: Excel-style table ranges such as "A1:D20".
+    """
     df = pd.DataFrame(sheet_data)
     non_empty = df.notna() & df.map(lambda x: str(x).strip() != "")
 
@@ -233,6 +338,16 @@ def _detect_tables_in_sheet_values(
     start_row = None
 
     def _add_range(s_row: int, e_row: int) -> None:
+        """
+        Adds a detected row block as an Excel-style range.
+
+        Args:
+            s_row (int): Zero-based starting row index.
+            e_row (int): Zero-based ending row index.
+
+        Returns:
+            None
+        """
         tdf = df.iloc[s_row: e_row + 1]
         has_data = tdf.apply(lambda c: c.notna().sum() > 0).values
         if not has_data.any():
@@ -265,6 +380,21 @@ def _extract_formatted_table(
     sheet_format: Worksheet,
     region: Tuple[int, int, int, int],
 ) -> pd.DataFrame:
+    """
+    Extracts a formatted Excel table region into a DataFrame.
+
+    The first row of the region is treated as the header row. Merged-cell values
+    and formula text are preserved where normal calculated values are missing.
+
+    Args:
+        sheet_values (Worksheet): Worksheet loaded with calculated cell values.
+        sheet_format (Worksheet): Worksheet loaded with formulas and formatting.
+        region (Tuple[int, int, int, int]): Table region as
+            (start_row, end_row, start_col, end_col).
+
+    Returns:
+        pd.DataFrame: Extracted table data with headers applied.
+    """
     start_row, end_row, start_col, end_col = region
     merge_map = _build_merge_map(sheet_format, sheet_values)
 
@@ -298,6 +428,15 @@ def _extract_formatted_table(
 
 
 def _excel_col_to_index(col: str) -> int:
+    """
+    Converts an Excel column letter into a zero-based column index.
+
+    Args:
+        col (str): Excel column label, such as A, Z, AA, or AB.
+
+    Returns:
+        int: Zero-based column index.
+    """
     col = col.upper()
     result = 0
     for char in col:
@@ -306,6 +445,23 @@ def _excel_col_to_index(col: str) -> int:
 
 
 def _read_df_range(df: pd.DataFrame, excel_range: str) -> pd.DataFrame:
+    """
+    Reads a specific Excel-style range from a DataFrame.
+
+    The function parses a range such as "A1:D20", converts it into DataFrame
+    indexes, clips the range safely within the DataFrame shape, and returns the
+    selected block.
+
+    Args:
+        df (pd.DataFrame): Raw worksheet DataFrame.
+        excel_range (str): Excel-style cell range to read.
+
+    Returns:
+        pd.DataFrame: DataFrame slice matching the requested range.
+
+    Raises:
+        ValueError: If the provided range is not in a valid Excel range format.
+    """
     m = re.match(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", excel_range.upper())
     if not m:
         raise ValueError(f"Invalid range: {excel_range}")
@@ -323,6 +479,25 @@ def _read_df_range(df: pd.DataFrame, excel_range: str) -> pd.DataFrame:
 
 
 def load_data(file_path: str) -> pd.DataFrame:
+    """
+    Loads data from a CSV or Excel workbook.
+
+    For CSV files, the function reads the file directly into a DataFrame. For
+    Excel files, it attempts to detect formatted tables first. If no formatted
+    tables are found, it falls back to value-based table block detection or
+    whole-sheet extraction.
+
+    Args:
+        file_path (str): Path to the CSV, XLSX, XLSM, or XLS input file.
+
+    Returns:
+        pd.DataFrame: Combined DataFrame containing all extracted table data.
+
+    Raises:
+        FileNotFoundError: If the input file path does not exist.
+        ValueError: If the file type is unsupported, the CSV is empty, or no data
+            can be extracted from the workbook.
+    """
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {file_path}")
@@ -439,6 +614,16 @@ _STYLES_CACHE: Dict[str, Any] = {}
 
 
 def _build_styles() -> Tuple[Any, Any, Any, Any]:
+    """
+    Builds and caches ReportLab paragraph styles used in the generated PDF.
+
+    The function creates title, section heading, body, and monospace styles.
+    Once built, the styles are stored in a module-level cache so repeated calls
+    reuse the same style objects.
+
+    Returns:
+        Tuple[Any, Any, Any, Any]: Title, heading, body, and monospace styles.
+    """
     global _STYLES_CACHE
     if _STYLES_CACHE:
         return (
@@ -478,6 +663,3 @@ def _build_styles() -> Tuple[Any, Any, Any, Any]:
 
     _STYLES_CACHE = {"title": title_style, "h1": h1_style, "body": body_style, "mono": mono_style}
     return title_style, h1_style, body_style, mono_style
-
-
-
