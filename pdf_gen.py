@@ -954,9 +954,8 @@ import time
 
 if __name__ == "__main__":
     start = time.time()
-
     INPUT_FILE = "Financial Sample-3.xlsx"
-    OUTPUT_FILE = "report_multisheet.pdf"
+    OUTPUT_FILE = Path(INPUT_FILE).stem + ".pdf"
 
     df = load_data(INPUT_FILE)
     report = PDFGenerationReport(df)
