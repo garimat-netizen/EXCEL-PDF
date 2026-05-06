@@ -51,6 +51,17 @@ from preprocess_file import load_data, detect_numeric_columns, _build_styles
 #-----PDF GENERATION MODULE -------#
 
 class PDFGenerationReport:
+    """
+    Generates a complete PDF data analysis report from a pandas DataFrame.
+
+    This class handles dataset profiling, statistical analysis, LLM-based section
+    selection, grounded narrative generation, and PDF rendering. All report content
+    is based on Python-computed values so the LLM explains verified results instead
+    of inventing or calculating data independently.
+
+    Attributes:
+        df (pd.DataFrame): Cleaned working DataFrame used for report generation.
+    """
 
     SECTION_CATALOGUE = [
         {"id": "executive_summary", "title": "Executive Summary",
@@ -128,9 +139,34 @@ class PDFGenerationReport:
     MONO_SECTIONS = {"dataset_overview", "missing_values", "statistical_summary"}
 
     def __init__(self, df: pd.DataFrame) -> None:
+        """
+        Initializes the PDF report generator.
+
+        Internal preprocessing columns such as sheet and table identifiers are removed
+        because they are metadata fields and should not appear in the final analysis.
+
+        Args:
+            df (pd.DataFrame): Input DataFrame loaded from the source file.
+
+        Returns:
+            None
+        """
         self.df = df.drop(columns=["__sheet__", "__table__"], errors="ignore")
 
     def run(self, output: str = "report.pdf") -> None:
+        """
+        Runs the full PDF report generation workflow.
+
+        This method analyzes the dataset, asks the LLM to select the most relevant
+        report sections, generates content for each selected section, builds the PDF,
+        and prints a short completion summary.
+
+        Args:
+            output (str): Output path where the generated PDF file will be saved.
+
+        Returns:
+            None
+        """
         df = self.df
 
         log.info("Running statistical analysis...")
@@ -185,13 +221,35 @@ class PDFGenerationReport:
             print(f"    {i:2}. {title}")
 
     def clean_llm_output(self, text: str) -> str:
-        
+        """
+        LLM responses may include internal text before a `</think>` marker.
+        This function keeps only the final response after that marker so the report
+        contains clean, user-facing content.
+
+        Args:
+            text (str): Raw text returned by the LLM.
+
+        Returns:
+            str: Cleaned LLM response text.
+        """
 
         parts = text.split("</think>", 1)
         return parts[1].strip() if len(parts) > 1 else text
 
 
     def safe_llm(self, system: str, user: str, fallback: str = "[Content unavailable]") -> str:
+        """
+        Calls the nemotron  safely and normalizes the returned text.
+
+        Args:
+            system (str): System prompt that defines the LLM role and rules.
+            user (str): User prompt containing the task and grounded data.
+            fallback (str): Text returned if the LLM call fails.
+
+        Returns:
+            str: Cleaned and PDF-safe LLM output, or the fallback message.
+        """
+
         try:
             result = call_llm(system, user)
 
@@ -203,21 +261,48 @@ class PDFGenerationReport:
             return fallback
 
     def llm_narrative(self, role: str, task: str, grounded_data: dict) -> str:
+        """
+        Generates an LLM-written narrative for a report section.
+
+        The function converts Python-computed data into JSON, builds a strict prompt
+        to prevent hallucination, and sends the task plus grounded data to safe_llm().
+
+        Args:
+            role (str): Analyst role the LLM should follow for the narrative.
+            task (str): Specific instruction for the report section.
+            grounded_data (dict): Python-computed facts the LLM is allowed to use.
+
+        Returns:
+            str: LLM-generated narrative grounded only in the provided data.
+        """
         context_json = json.dumps(grounded_data, indent=2, default=str)
         
         system = f"""
-You are a {role}.
+                    You are a {role}.
 
-STRICT RULES:
-- Use ONLY provided data
-- DO NOT invent or infer missing values
-"""
+                    STRICT RULES:
+                    - Use ONLY provided data
+                    - DO NOT invent or infer missing values
+                    """
 
         user = f"{task}\n\nPRE-COMPUTED DATA (Python-verified):\n{context_json}"
         return self.safe_llm(system, user)
 
     @staticmethod
     def _safe_float(x) -> Optional[float]:
+        """
+        Safely converts a value into a rounded float for reporting.
+
+        If the value cannot be converted, or if it becomes NaN or infinity,
+        the function returns None so invalid numbers do not appear in the PDF.
+
+        Args:
+            x: Value to convert into a float.
+
+        Returns:
+            Optional[float]: Rounded float value, or None if conversion is invalid.
+        """
+
         try:
             v = float(x)
             return None if (np.isnan(v) or np.isinf(v)) else round(v, 6)
@@ -225,6 +310,24 @@ STRICT RULES:
             return None
 
     def analyze_data(self, df: pd.DataFrame) -> dict:
+        """
+        Performs the main statistical analysis on the extracted dataset.
+
+        This function identifies numeric and categorical columns, cleans numeric
+        values, calculates descriptive statistics, detects missing values,
+        finds duplicate rows, computes correlations, and flags outliers using
+        IQR and Z-score methods.
+
+        Args:
+            df (pd.DataFrame): Input dataset to analyze.
+
+        Returns:
+            dict: Python-computed analysis results used by PDF sections and LLM
+            narratives, including shape, columns, dtypes, statistics, correlations,
+            missing-value summary, duplicate count, and outlier details.
+        """
+
+
         #editing copy
         df  = df.copy()
         numeric_cols = detect_numeric_columns(df)
@@ -370,6 +473,23 @@ STRICT RULES:
         }
 
     def generate_llm_context(self, df: pd.DataFrame) -> dict:
+        """
+        Builds a compact, structured summary of the dataset for LLM consumption.
+
+        Instead of sending the full dataframe to the LLM, this function prepares
+        key context such as column types, sample rows, missing values, top category
+        values, numeric summaries, and likely column roles.
+
+        Args:
+            df (pd.DataFrame): Dataset used to build summarized LLM context.
+
+        Returns:
+            dict: Compact dataset profile containing row count, column count, column
+            types, cardinality, sample rows, missing values, duplicate rows, numeric
+            summaries, and inferred column roles.
+        """
+
+
         n = len(df)
         context: dict = {
             "row_count": n,
@@ -438,6 +558,21 @@ STRICT RULES:
         return context
 
     def select_sections(self, analysis: dict) -> List[str]:
+        """
+        Selects the most relevant report sections based on the dataset profile.
+
+        This function sends a summarized analysis profile and the available section
+        catalogue to the LLM, asking it to choose exactly 10 sections that best fit
+        the data. If the LLM response is invalid or cannot be parsed, the function
+        falls back to a default set of general-purpose analytical sections.
+
+        Args:
+            analysis (dict): Python-computed dataset analysis dictionary.
+
+        Returns:
+            List[str]: Exactly 10 selected section IDs.
+        """
+
         catalogue_text = "\n".join(
             f'  id: "{s["id"]}"  |  when_useful: "{s["description"]}"'
             for s in self.SECTION_CATALOGUE
@@ -489,6 +624,20 @@ STRICT RULES:
             return defaults
 
     def _gen_executive_summary(self, a: dict) -> str:
+        """
+        Generates the executive summary section of the PDF report.
+
+        This function prepares a compact set of high-level dataset insights such as
+        dataset size, missing data, duplicate rows, strong correlations, numeric means,
+        and top outlier columns, then passes that verified context to the LLM.
+
+        Args:
+            a (dict): Analysis dictionary containing dataset metadata, missing values,
+            duplicate counts, correlations, numeric means, and column statistics.
+
+        Returns:
+            str: Executive summary narrative generated from verified analysis data.
+        """
         grounded = {
             "shape": a["shape"],
             "columns": a["columns"],
@@ -503,17 +652,17 @@ STRICT RULES:
             ][:5],
         }
         task = """
-Write an executive summary using ONLY the provided data.
+            Write an executive summary using ONLY the provided data.
 
-Requirements:
-- Maximum 100 words
-- Must include:
-  1. Dataset size (rows, columns)
-  2. Missing data (count and percentage)
-  3. Correlations (only if present)
-  4. One clear business takeaway
+            Requirements:
+            - Maximum 100 words
+            - Must include:
+            1. Dataset size (rows, columns)
+            2. Missing data (count and percentage)
+            3. Correlations (only if present)
+            4. One clear business takeaway
 
-"""
+        """
         return self.llm_narrative(
     "senior business analyst",
     task,
@@ -521,6 +670,20 @@ Requirements:
 )
 
     def _gen_dataset_overview(self, a: dict) -> str:
+        """
+        Generates the dataset overview section of the PDF report.
+
+        This function creates a technical summary of the dataset, including the
+        total number of rows, total number of columns, column names, and detected
+        data types.
+
+        Args:
+            a (dict): Analysis dictionary containing shape, columns, and dtypes.
+
+        Returns:
+            str: Plain-text dataset overview formatted for monospace PDF output.
+        """
+   
         lines = [
             f"Rows:    {a['shape']['rows']:,}",
             f"Columns: {a['shape']['cols']}",
@@ -533,6 +696,23 @@ Requirements:
         return "\n".join(lines)
 
     def _gen_missing_values(self, a: dict) -> str:
+        """
+        Generates the missing value analysis section of the PDF report.
+
+        This function summarizes overall missing data, duplicate rows, and
+        per-column missing counts using the Python-computed analysis dictionary.
+        It also highlights high-risk columns where more than 20% of values are
+        missing.
+
+        Args:
+            a (dict): Analysis dictionary containing missing summary, duplicate
+            count, column statistics, categorical statistics, and column names.
+
+        Returns:
+            str: Plain-text missing-value summary formatted for PDF output.
+        """
+
+
         ms = a["missing_summary"]
         lines = [
             f"Total missing cells : {ms['total_missing']:,}  ({ms['missing_pct']} % of all cells)",
@@ -553,6 +733,20 @@ Requirements:
         return "\n".join(lines)
 
     def _gen_statistical_summary(self, a: dict) -> str:
+        """
+        Generates the statistical summary section of the PDF report.
+
+        This function formats key descriptive statistics for each numeric column,
+        including count, mean, median, standard deviation, minimum, maximum,
+        and skewness.
+
+        Args:
+            a (dict): Analysis dictionary containing computed numeric column statistics.
+
+        Returns:
+            str: Aligned plain-text statistical summary for monospace PDF output.
+        """
+
         rows = [
             f"{'Column':<30} {'Count':>7} {'Mean':>14} {'Median':>14} "
             f"{'Std':>14} {'Min':>14} {'Max':>14} {'Skew':>8}"
@@ -560,6 +754,15 @@ Requirements:
         rows.append("-" * 113)
         for col, s in a["column_stats"].items():
             def f(v):
+                """
+                Formats a numeric value for the statistical summary table.
+
+                Args:
+                    v: Numeric value to format.
+
+                Returns:
+                    str: Right-aligned formatted number, or N/A if the value is missing.
+                """
                 return f"{v:>14,.4f}" if v is not None else f"{'N/A':>14}"
             rows.append(
                 f"{col:<30} {s['count']:>7,} {f(s['mean'])} {f(s['median'])} "
@@ -569,6 +772,20 @@ Requirements:
         return "\n".join(rows)
 
     def _gen_trend_analysis(self, a: dict) -> str:
+        """
+        Generates the trend analysis section of the PDF report.
+
+        This function prepares key numeric statistics such as mean, median,
+        standard deviation, skew label, and percentile values for each numeric
+        column, then sends them to the LLM for interpretation.
+
+        Args:
+            a (dict): Analysis dictionary containing numeric means and column statistics.
+
+        Returns:
+            str: Trend-style narrative generated from verified numeric summaries.
+        """
+
         grounded = {
             "numeric_means": a["numeric_means"],
             "column_details": {
@@ -578,15 +795,15 @@ Requirements:
             },
         }
         task = """
-Analyze numeric columns using provided statistics.
+                Analyze numeric columns using provided statistics.
 
-Output:
-- Highest mean column
-- Lowest mean column
-- Most variable column (highest std)
-- Any skewed columns (left/right)
+                Output:
+                - Highest mean column
+                - Lowest mean column
+                - Most variable column (highest std)
+                - Any skewed columns (left/right)
 
-"""
+             """
         return self.llm_narrative(
             "data analyst",
             task,
@@ -594,6 +811,23 @@ Output:
         )
 
     def _gen_correlation_analysis(self, a: dict) -> str:
+        """
+        Generates the correlation analysis section of the PDF report.
+
+        This function uses Python-computed Pearson correlation values to identify
+        relationships between numeric columns. Strong correlations are already
+        filtered during analysis using the configured threshold.
+
+        Args:
+            a (dict): Analysis dictionary containing all correlations and strong
+            correlation pairs.
+
+        Returns:
+            str: Correlation interpretation, or a message if correlation analysis
+            is not possible.
+        """
+
+
         if not a["correlations"]:
             return "Not enough numeric columns for correlation analysis."
         grounded = {
@@ -609,6 +843,22 @@ Output:
         )
 
     def _gen_outlier_detection(self, a: dict) -> str:
+        """
+        Generates the anomaly and outlier detection section of the PDF report.
+
+        This function collects numeric columns where Python detected outliers using
+        either the IQR method or the Z-score method, along with counts, percentages,
+        example values, and boundary thresholds.
+
+        Args:
+            a (dict): Analysis dictionary containing numeric column statistics and
+            outlier details.
+
+        Returns:
+            str: Outlier interpretation, or a message if no outliers are detected.
+        """
+
+
         outlier_summary = [
             {
                 "column": col,
@@ -633,6 +883,23 @@ Output:
         )
 
     def _gen_distribution_analysis(self, a: dict) -> str:
+        """
+        Generates the distribution analysis section of the PDF report.
+
+        This function prepares distribution-related statistics for each numeric
+        column, including mean, median, standard deviation, skewness, kurtosis,
+        and percentile range.
+
+        Args:
+            a (dict): Analysis dictionary containing distribution statistics for
+            numeric columns.
+
+        Returns:
+            str: Distribution interpretation generated from verified statistics.
+        """
+
+
+
         dist_data = {
             col: {
                 "mean": s["mean"], "median": s["median"], "std": s["std"],
@@ -642,12 +909,12 @@ Output:
             for col, s in a["column_stats"].items()
         }
         task = """
-Describe distribution for each numeric column.
+                Describe distribution for each numeric column.
 
-Output for each column:
-[Column] — symmetric / left-skewed / right-skewed — implication (1 line)
+                Output for each column:
+                [Column] — symmetric / left-skewed / right-skewed — implication (1 line)
 
-"""
+            """
         return self.llm_narrative(
             "statistician",
             task, 
@@ -655,6 +922,22 @@ Output for each column:
         )
 
     def _gen_categorical_analysis(self, a: dict) -> str:
+
+        """
+        Generates the categorical or segment analysis section of the PDF report.
+
+        This function checks whether the dataset contains categorical columns and,
+        if available, passes their Python-computed value distributions to the LLM.
+
+        Args:
+            a (dict): Analysis dictionary containing categorical column statistics.
+
+        Returns:
+            str: Categorical analysis narrative, or a message if no categorical
+            columns are available.
+        """
+
+
         if not a["categorical_stats"]:
             return "No categorical columns found in this dataset."
         return self.llm_narrative(
@@ -665,6 +948,21 @@ Output for each column:
         )
 
     def _gen_kpi_analysis(self, a: dict) -> str:
+        """
+        Generates the KPI analysis section of the PDF report.
+
+        This function uses available column names, numeric means, and selected
+        descriptive statistics to identify possible KPI-style metrics. The LLM
+        is instructed to evaluate only the provided data and classify each metric
+        as high, medium, or low performance with any visible concerns.
+
+        Args:
+            a (dict): Analysis dictionary containing dataset columns, numeric means,
+            and computed statistics for numeric columns.
+
+        Returns:
+            str: KPI analysis narrative generated from Python-computed statistics.
+        """
         grounded = {
             "columns": a["columns"],
             "numeric_means": a["numeric_means"],
@@ -675,13 +973,13 @@ Output for each column:
             },
         }
         task = """
-Identify KPIs strictly from provided column names and values.
+            Identify KPIs strictly from provided column names and values.
 
-Output format:
-[Column Name] — performance level (high/medium/low) — concern (if any)
+            Output format:
+            [Column Name] — performance level (high/medium/low) — concern (if any)
 
 
-"""
+        """
         return self.llm_narrative(
             "business performance expert",
             task, 
@@ -689,6 +987,22 @@ Output format:
         )
 
     def _gen_revenue_analysis(self, a: dict) -> str:
+        """
+        Generates the revenue and sales analysis section of the PDF report.
+
+        This function identifies revenue-related numeric columns by checking column
+        names for business keywords such as revenue, sales, profit, income, gross,
+        net, and amount.
+
+        Args:
+            a (dict): Analysis dictionary containing numeric columns, column statistics,
+            and strong correlation details.
+
+        Returns:
+            str: Revenue analysis narrative, or a message if no revenue-like columns
+            are detected.
+        """
+
         revenue_cols = [
             c for c in a["numeric_columns"]
             if any(k in c.lower() for k in ("revenue", "sales", "gross", "net", "profit", "income", "amount"))
@@ -710,6 +1024,21 @@ Output format:
         )
 
     def _gen_cost_efficiency(self, a: dict) -> str:
+        """
+        Generates the cost and efficiency analysis section of the PDF report.
+
+        This function identifies cost-related numeric columns by checking column
+        names for keywords such as cost, expense, COGS, margin, discount, and spend.
+
+        Args:
+            a (dict): Analysis dictionary containing numeric columns and column
+            statistics.
+
+        Returns:
+            str: Cost and efficiency analysis narrative, or a message if no relevant
+            columns are detected.
+        """
+
         cost_cols = [
             c for c in a["numeric_columns"]
             if any(k in c.lower() for k in ("cost", "expense", "cogs", "margin", "discount", "spend"))
@@ -725,6 +1054,21 @@ Output format:
         )
 
     def _gen_risk_assessment(self, a: dict) -> str:
+        """
+        Generates the risk assessment section of the PDF report.
+
+        This function prepares risk-related indicators such as missing data,
+        duplicate rows, detected outliers, and high-variation numeric columns.
+
+        Args:
+            a (dict): Analysis dictionary containing missing values, duplicate rows,
+            outlier statistics, and numeric column statistics.
+
+        Returns:
+            str: Risk assessment narrative generated from verified risk indicators.
+        """
+
+
         grounded = {
             "missing_summary": a["missing_summary"],
             "duplicate_rows": a["duplicate_rows"],
@@ -747,6 +1091,19 @@ Output format:
         )
 
     def _gen_opportunities(self, a: dict) -> str:
+        """
+        Generates the opportunities and growth areas section of the PDF report.
+
+        This function prepares high-level opportunity signals such as numeric
+        averages, strong correlations, available columns, and dataset size.
+
+        Args:
+            a (dict): Analysis dictionary containing numeric means, strong correlations,
+            columns, and dataset shape.
+
+        Returns:
+            str: Opportunities narrative grounded in verified dataset statistics.
+        """
         grounded = {
             "numeric_means": a["numeric_means"],
             "strong_correlations": a["strong_correlations"][:5],
@@ -761,6 +1118,21 @@ Output format:
         )
 
     def _gen_forecasting(self, a: dict) -> str:
+        """
+        Generates the forecasting and future trends section of the PDF report.
+
+        This function prepares basic forward-looking indicators such as numeric
+        means, standard deviations, skew labels, and strong correlations. It does
+        not perform true time-series forecasting.
+
+        Args:
+            a (dict): Analysis dictionary containing numeric means, column statistics,
+            and strong correlations.
+
+        Returns:
+            str: Cautious directional outlook based only on available summary statistics.
+        """
+
         grounded = {
             "numeric_means": a["numeric_means"],
             "column_stats": {
@@ -770,19 +1142,19 @@ Output format:
             "strong_correlations": a["strong_correlations"][:3],
         }
         task = """
-Provide simple directional outlook based on means and variability.
+            Provide simple directional outlook based on means and variability.
 
-Output:
-- Upward / stable / uncertain trend for each key metric
+            Output:
+            - Upward / stable / uncertain trend for each key metric
 
-Rules:
-- Base ONLY on mean and std
-- DO NOT predict exact numbers
-- DO NOT assume time-series
+            Rules:
+            - Base ONLY on mean and std
+            - DO NOT predict exact numbers
+            - DO NOT assume time-series
 
-If insufficient data:
-"Insufficient data for forecasting"
-"""
+            If insufficient data:
+            "Insufficient data for forecasting"
+        """
         return self.llm_narrative(
             "forecasting expert",
             task, 
@@ -790,6 +1162,22 @@ If insufficient data:
         )
 
     def _gen_geographic_analysis(self, a: dict) -> str:
+        """
+        Generates the geographic and regional analysis section of the PDF report.
+
+        This function identifies location-related categorical columns by checking
+        column names for keywords such as country, region, city, state, location,
+        geography, geo, and market.
+
+        Args:
+            a (dict): Analysis dictionary containing categorical columns and
+            categorical statistics.
+
+        Returns:
+            str: Geographic analysis narrative, or a message if no geographic
+            columns are detected.
+        """
+
         geo_cols = [
             c for c in a["categorical_columns"]
             if any(k in c.lower() for k in ("country", "region", "city", "state", "location", "geography", "geo", "market"))
@@ -805,6 +1193,21 @@ If insufficient data:
         )
 
     def _gen_customer_analysis(self, a: dict) -> str:
+        """
+        Generates the customer and segment behaviour section of the PDF report.
+
+        This function identifies customer-related categorical columns by checking
+        column names for keywords such as customer, segment, channel, product,
+        and category.
+
+        Args:
+            a (dict): Analysis dictionary containing categorical columns, categorical
+            statistics, numeric means, and strong correlations.
+
+        Returns:
+            str: Customer or segment behaviour narrative generated from verified data.
+        """
+
         cust_cols = [
             c for c in a["categorical_columns"]
             if any(k in c.lower() for k in ("customer", "segment", "channel", "product", "category"))
@@ -822,6 +1225,19 @@ If insufficient data:
         )
 
     def _gen_strategic_recommendations(self, a: dict) -> str:
+        """
+        Generates the strategic recommendations section of the PDF report.
+
+        This function prepares decision-making inputs such as dataset size,
+        missing data, strong correlations, numeric averages, and outlier summaries.
+
+        Args:
+            a (dict): Analysis dictionary containing shape, missing summary, strong
+            correlations, numeric means, and outlier statistics.
+
+        Returns:
+            str: Prioritized strategic recommendations based on verified analysis data.
+        """
         grounded = {
             "shape": a["shape"],
             "missing_summary": a["missing_summary"],
@@ -840,6 +1256,26 @@ If insufficient data:
         )
 
     def _gen_key_questions(self, a: dict) -> str:
+        """
+        Generates data-specific strategic questions for the PDF report.
+
+        This method builds a grounded context from the dataset analysis results,
+        including column names, numeric means, top correlations, and missing-value
+        summaries. It then asks the LLM to generate questions that are tied directly
+        to the actual dataset structure and values.
+
+        Args:
+            a (dict): Analysis dictionary containing dataset metadata and summaries.
+                Expected keys include:
+                - "columns": List of dataset column names.
+                - "numeric_means": Mean values for numeric columns.
+                - "strong_correlations": Ranked list of strong column correlations.
+                - "missing_summary": Missing-value summary by column.
+
+        Returns:
+            str: Ten specific dataset-related questions, or a message indicating
+            insufficient data if meaningful questions cannot be generated.
+        """
         grounded = {
             "columns": a["columns"],
             "numeric_means": a["numeric_means"],
@@ -847,16 +1283,16 @@ If insufficient data:
             "missing_summary": a["missing_summary"],
         }
         task = """
-Generate 10 specific questions based on actual columns and values.
+            Generate 10 specific questions based on actual columns and values.
 
-Rules:
-- Each question must reference a column name
-- No generic business questions
-- Keep each under 15 words
+            Rules:
+            - Each question must reference a column name
+            - No generic business questions
+            - Keep each under 15 words
 
-If insufficient data:
-"Insufficient data for questions"
-"""
+            If insufficient data:
+            "Insufficient data for questions"
+        """
         return self.llm_narrative(
             "senior analyst",
          task, 
@@ -865,6 +1301,20 @@ If insufficient data:
 
     @staticmethod
     def _safe_paragraph(text: str, style) -> Paragraph:
+        """
+        Creates a ReportLab paragraph after escaping unsafe XML/HTML characters.
+
+        ReportLab paragraphs interpret special characters such as ampersands and angle
+        brackets. This helper escapes those characters so raw dataset text or LLM output
+        does not break PDF rendering.
+
+        Args:
+            text (str): Text content to place inside the paragraph.
+            style: ReportLab paragraph style used for rendering the text.
+
+        Returns:
+            Paragraph: Safe ReportLab Paragraph object ready to be added to the PDF.
+        """
         safe = (
             text.replace("&", "&amp;")
                 .replace("<", "&lt;")
@@ -882,6 +1332,25 @@ If insufficient data:
         body,
         mono,
     ) -> list:
+        """
+        Builds the PDF elements for one report section.
+
+        The method adds a divider, section heading, formatted paragraphs, and spacing.
+        Monospace styling is applied to technical sections such as dataset overview,
+        missing values, and statistical summary.
+
+        Args:
+            number (int): Section number shown in the PDF.
+            section_id (str): Internal section identifier used to choose formatting.
+            title (str): Display title of the report section.
+            content (str): Generated section text to render.
+            h1: ReportLab style used for the section heading.
+            body: ReportLab style used for normal paragraph text.
+            mono: ReportLab style used for monospace technical text.
+
+        Returns:
+            list: ReportLab flowable elements representing the complete section block.
+        """
         style = mono if section_id in self.MONO_SECTIONS else body
         elements = [
             HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cccccc"), spaceAfter=4),
@@ -900,6 +1369,21 @@ If insufficient data:
         analysis: dict,
         sections: List[Tuple[str, str, str]],
     ) -> None:
+        """
+        Builds and writes the final PDF report.
+
+        This method creates the PDF document, adds a title page with dataset metadata,
+        renders each selected report section, and saves the completed PDF to disk.
+
+        Args:
+            output_path (str): File path where the PDF should be written.
+            analysis (dict): Python-computed dataset analysis used for metadata display.
+            sections (List[Tuple[str, str, str]]): Selected report sections as tuples of
+                section ID, section title, and generated content.
+
+        Returns:
+            None
+        """
         doc = SimpleDocTemplate(
             output_path, pagesize=A4,
             leftMargin=2 * cm, rightMargin=2 * cm,
@@ -954,8 +1438,9 @@ import time
 
 if __name__ == "__main__":
     start = time.time()
+
     INPUT_FILE = "Financial Sample-3.xlsx"
-    OUTPUT_FILE = Path(INPUT_FILE).stem + ".pdf"
+    OUTPUT_FILE = "report_multisheet.pdf"
 
     df = load_data(INPUT_FILE)
     report = PDFGenerationReport(df)
