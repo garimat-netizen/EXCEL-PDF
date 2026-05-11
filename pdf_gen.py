@@ -6,6 +6,7 @@ import json
 import logging
 import tempfile
 import textwrap
+import time
 import traceback
 from collections import Counter
 from pathlib import Path
@@ -138,12 +139,17 @@ class PDFGenerationReport:
 
     MONO_SECTIONS = {"dataset_overview", "missing_values", "statistical_summary"}
 
+    META_COLS = ["__sheet__", "__table__", "__excel_name__", "__range__"]
+
     def __init__(self, df: pd.DataFrame) -> None:
         """
         Initializes the PDF report generator.
 
-        Internal preprocessing columns such as sheet and table identifiers are removed
-        because they are metadata fields and should not appear in the final analysis.
+        The raw DataFrame (including metadata columns __sheet__, __table__,
+        __excel_name__, and __range__) is split into per-table groups so that
+        each table receives its own PDF section with 10 subsections.
+        Metadata columns are removed from the analytical DataFrame passed to
+        each section generator.
 
         Args:
             df (pd.DataFrame): Input DataFrame loaded from the source file.
@@ -151,15 +157,45 @@ class PDFGenerationReport:
         Returns:
             None
         """
-        self.df = df.drop(columns=["__sheet__", "__table__"], errors="ignore")
+        self._raw_df = df  # full df with meta columns intact
+
+        # Build list of (table_meta_dict, clean_df) pairs – one entry per table
+        self._tables: List[Tuple[dict, pd.DataFrame]] = []
+        group_cols = [c for c in ["__sheet__", "__table__"] if c in df.columns]
+        if group_cols:
+            for keys, grp in df.groupby(group_cols, sort=False):
+                if not isinstance(keys, tuple):
+                    keys = (keys,)
+                meta = {
+                    "sheet_name": str(keys[0]) if len(keys) > 0 else "",
+                    "table_num": int(keys[1]) if len(keys) > 1 else 1,
+                    "excel_name": str(grp["__excel_name__"].iloc[0]) if "__excel_name__" in grp.columns else "",
+                    "range": str(grp["__range__"].iloc[0]) if "__range__" in grp.columns else "",
+                }
+                clean = grp.drop(columns=self.META_COLS, errors="ignore").reset_index(drop=True)
+                self._tables.append((meta, clean))
+        else:
+            # No grouping columns – treat entire df as one table
+            meta = {"sheet_name": "", "table_num": 1, "excel_name": "", "range": ""}
+            clean = df.drop(columns=self.META_COLS, errors="ignore")
+            self._tables.append((meta, clean))
+
+        # Combined clean df kept for helpers that still need it
+        self.df = df.drop(columns=self.META_COLS, errors="ignore")
 
     def run(self, output: str = "report.pdf") -> None:
         """
         Runs the full PDF report generation workflow.
 
-        This method analyzes the dataset, asks the LLM to select the most relevant
-        report sections, generates content for each selected section, builds the PDF,
-        and prints a short completion summary.
+        For every detected table the method:
+          1. Runs statistical analysis on that table's DataFrame.
+          2. Asks the LLM to select exactly 10 subsections for that table.
+          3. Generates content for each subsection.
+          4. Collects the table metadata (sheet name, excel name, range) so it
+             can be printed just below the table heading in the PDF.
+
+        All per-table results are handed to build_pdf() which renders one
+        top-level section per table, each containing 10 numbered subsections.
 
         Args:
             output (str): Output path where the generated PDF file will be saved.
@@ -167,58 +203,69 @@ class PDFGenerationReport:
         Returns:
             None
         """
-        df = self.df
-
-        log.info("Running statistical analysis...")
-        analysis = self.analyze_data(df)
-        log.info(
-            "Analysis complete: %d numeric cols, %d categorical cols, "
-            "%d strong correlations, %d outlier cols",
-            len(analysis["numeric_columns"]),
-            len(analysis["categorical_columns"]),
-            len(analysis["strong_correlations"]),
-            sum(1 for s in analysis["column_stats"].values() if s["iqr_outlier_count"] > 0),
-        )
-
-        log.info("Asking LLM to select the 10 most relevant sections...")
-        selected_ids = self.select_sections(analysis)
-        log.info("LLM selected: %s", selected_ids)
-
         catalogue_map = {s["id"]: s for s in self.SECTION_CATALOGUE}
 
+        # per_table_data: list of (meta, analysis, sections_output)
+        per_table_data: List[Tuple[dict, dict, List[Tuple[str, str, str]]]] = []
+
         with tempfile.TemporaryDirectory():
-            log.info("Generating structured dataset context...")
-            llm_context = self.generate_llm_context(df)
+            for t_idx, (meta, df_table) in enumerate(self._tables):
+                table_label = f"Table {meta['table_num']} (sheet: {meta['sheet_name']})"
+                log.info("=== Processing %s (%d rows) ===", table_label, len(df_table))
 
-            log.info("Generating content for %d sections...", len(selected_ids))
-            sections_output = []
-
-            for sid in selected_ids:
-                if sid not in catalogue_map:
-                    log.warning("Unknown section id '%s', skipping.", sid)
+                if df_table.empty:
+                    log.warning("  Table is empty, skipping.")
                     continue
 
-                entry = catalogue_map[sid]
-                log.info("  Generating: %s", entry["title"])
+                log.info("  Running statistical analysis...")
+                analysis = self.analyze_data(df_table)
+                log.info(
+                    "  Analysis: %d numeric, %d categorical, %d strong corr, %d outlier cols",
+                    len(analysis["numeric_columns"]),
+                    len(analysis["categorical_columns"]),
+                    len(analysis["strong_correlations"]),
+                    sum(1 for s in analysis["column_stats"].values() if s["iqr_outlier_count"] > 0),
+                )
 
-                try:
-                    fn = getattr(self, entry["fn_name"])
-                    content = fn({**analysis, "llm_context": llm_context})
-                except Exception:
-                    log.warning("  Section '%s' failed:\n%s", sid, traceback.format_exc())
-                    content = "[Section generation failed — see logs]"
+                log.info("  Asking LLM to select 10 subsections...")
+                selected_ids = self.select_sections(analysis)
+                log.info("  LLM selected: %s", selected_ids)
 
-                if not content or not content.strip():
-                    content = "[No content generated for this section]"
+                log.info("  Generating LLM context...")
+                llm_context = self.generate_llm_context(df_table)
 
-                sections_output.append((sid, entry["title"], content))
+                log.info("  Generating content for %d subsections...", len(selected_ids))
+                sections_output: List[Tuple[str, str, str]] = []
+                for sid in selected_ids:
+                    if sid not in catalogue_map:
+                        log.warning("  Unknown section id '%s', skipping.", sid)
+                        continue
 
-            self.build_pdf(output, analysis, sections_output)
+                    entry = catalogue_map[sid]
+                    log.info("    Generating: %s", entry["title"])
+
+                    try:
+                        fn = getattr(self, entry["fn_name"])
+                        content = fn({**analysis, "llm_context": llm_context})
+                    except Exception:
+                        log.warning("    Subsection '%s' failed:\n%s", sid, traceback.format_exc())
+                        content = "[Subsection generation failed — see logs]"
+
+                    if not content or not content.strip():
+                        content = "[No content generated for this subsection]"
+
+                    sections_output.append((sid, entry["title"], content))
+
+                per_table_data.append((meta, analysis, sections_output))
+
+        self.build_pdf(output, per_table_data)
 
         print(f"\n  Report saved : {output}")
-        print(f"  Sections     : {len(sections_output)}")
-        for i, (sid, title, _) in enumerate(sections_output, 1):
-            print(f"    {i:2}. {title}")
+        print(f"  Tables       : {len(per_table_data)}")
+        for t_idx, (meta, _, secs) in enumerate(per_table_data, 1):
+            print(f"\n  Table {t_idx}: {meta['sheet_name']} | {meta['excel_name']} | {meta['range']}")
+            for i, (sid, title, _) in enumerate(secs, 1):
+                print(f"    {i:2}. {title}")
 
     def clean_llm_output(self, text: str) -> str:
         """
@@ -1366,20 +1413,23 @@ class PDFGenerationReport:
     def build_pdf(
         self,
         output_path: str,
-        analysis: dict,
-        sections: List[Tuple[str, str, str]],
+        per_table_data: List[Tuple[dict, dict, List[Tuple[str, str, str]]]],
     ) -> None:
         """
         Builds and writes the final PDF report.
 
-        This method creates the PDF document, adds a title page with dataset metadata,
-        renders each selected report section, and saves the completed PDF to disk.
+        The PDF contains one top-level section per detected table.  Each section
+        is headed with "Table N" and immediately followed by a three-row metadata
+        block (sheet name, excel file name, table range).  Below the metadata
+        block, ten numbered subsections present the LLM-generated analysis.
 
         Args:
             output_path (str): File path where the PDF should be written.
-            analysis (dict): Python-computed dataset analysis used for metadata display.
-            sections (List[Tuple[str, str, str]]): Selected report sections as tuples of
-                section ID, section title, and generated content.
+            per_table_data (List[Tuple[dict, dict, List[Tuple[str, str, str]]]]): 
+                One entry per table, each a tuple of:
+                  - meta dict  (sheet_name, excel_name, range, table_num)
+                  - analysis dict  (Python-computed statistics for this table)
+                  - sections_output list  (sid, title, content) × 10 subsections
 
         Returns:
             None
@@ -1391,59 +1441,84 @@ class PDFGenerationReport:
             title="Data Analysis Report", author="Report Generator",
         )
         title_style, h1, body, mono = _build_styles()
+
+        # Styles
+        base = getSampleStyleSheet()
+        sheet_heading_style = ParagraphStyle(
+            "SheetHeading", parent=base["Heading1"],
+            fontSize=14, leading=18,
+            textColor=colors.HexColor("#1a1a2e"),
+            spaceBefore=16, spaceAfter=4,
+            fontName="Helvetica-Bold",
+        )
+        table_heading_style = ParagraphStyle(
+            "TableHeading", parent=base["Heading2"],
+            fontSize=12, leading=16,
+            textColor=colors.HexColor("#16213e"),
+            spaceBefore=10, spaceAfter=6,
+            fontName="Helvetica-Bold",
+        )
+        subsection_heading_style = ParagraphStyle(
+            "SubsectionHeading", parent=base["Heading3"],
+            fontSize=11, leading=15,
+            textColor=colors.HexColor("#16213e"),
+            spaceBefore=10, spaceAfter=4,
+            fontName="Helvetica-Bold",
+        )
+
         story: list = []
 
-        story.append(Spacer(1, 2 * cm))
-        story.append(Paragraph("Data Analysis Report", title_style))
-        story.append(Spacer(1, 0.5 * cm))
-        story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#1a1a2e")))
-        story.append(Spacer(1, 0.5 * cm))
+        # Group tables by sheet so ## Sheet: X only prints once per sheet
+        seen_sheets: set = set()
 
-        cols_display = ", ".join(analysis["columns"])
-        if len(cols_display) > 120:
-            cols_display = cols_display[:120] + "..."
+        # ── One section per table ─────────────────────────────────────
+        for t_idx, (meta, analysis, sections_output) in enumerate(per_table_data, start=1):
+            sheet_name = meta.get("sheet_name", "")
+            table_num  = meta.get("table_num", t_idx)
+            rng        = meta.get("range", "")
 
-        meta_data = [
-            ["Shape", f"{analysis['shape']['rows']:,} rows  x  {analysis['shape']['cols']} columns"],
-            ["Columns", cols_display],
-            ["Numeric", str(len(analysis["numeric_columns"])) + " columns"],
-            ["Categorical", str(len(analysis["categorical_columns"])) + " columns"],
-            ["Missing", f"{analysis['missing_summary']['missing_pct']} % of all cells"],
-            ["Duplicates", f"{analysis['duplicate_rows']:,} rows"],
-            ["Sections", f"{len(sections)} (LLM-selected from {len(self.SECTION_CATALOGUE)} candidates)"],
-        ]
-        meta_table = Table(meta_data, colWidths=[3.5 * cm, 13.5 * cm])
-        meta_table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-            ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#16213e")),
-            ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.HexColor("#f0f0f0"), colors.white]),
-            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cccccc")),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ]))
-        story.append(meta_table)
-        story.append(PageBreak())
+            # ── Sheet heading (printed once per unique sheet) ───────────────────
+            if sheet_name not in seen_sheets:
+                story.append(
+                    HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#1a1a2e"), spaceAfter=4)
+                )
+                story.append(Paragraph(f"## Sheet: {sheet_name}", sheet_heading_style))
+                seen_sheets.add(sheet_name)
 
-        for idx, (section_id, title, content) in enumerate(sections, start=1):
-            story.extend(self._section_block(idx, section_id, title, content, h1, body, mono))
+            # ── Table heading with range inline ───────────────────────────────
+            story.append(
+                Paragraph(f"#### Table {table_num} (Range: {rng})", table_heading_style)
+            )
+            story.append(Spacer(1, 0.2 * cm))
+
+            # ── 10 numbered subsections ───────────────────────────────────────────
+            for sub_idx, (section_id, title, content) in enumerate(sections_output, start=1):
+                style = mono if section_id in self.MONO_SECTIONS else body
+                story.append(
+                    HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#cccccc"), spaceAfter=3)
+                )
+                story.append(Paragraph(f"{t_idx}.{sub_idx} {title}", subsection_heading_style))
+                for para in content.split("\n"):
+                    para = para.strip()
+                    if para:
+                        story.append(self._safe_paragraph(para, style))
+                story.append(Spacer(1, 0.25 * cm))
+
+            story.append(PageBreak())
 
         doc.build(story)
         log.info("PDF written to '%s'", output_path)
 
 
-import time
 
 if __name__ == "__main__":
     start = time.time()
 
-    INPUT_FILE = "Financial Sample-3.xlsx"
-    OUTPUT_FILE = "report_multisheet.pdf"
+    input_path = Path("AdventureWorks Sales.xlsx")
+    output_path = input_path.with_suffix(".pdf")
 
-    df = load_data(INPUT_FILE)
+    df = load_data(str(input_path))
     report = PDFGenerationReport(df)
-    report.run(OUTPUT_FILE)
+    report.run(str(output_path))
 
     print(time.time() - start, "seconds")
