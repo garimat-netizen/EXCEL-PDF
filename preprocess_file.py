@@ -532,10 +532,14 @@ def load_data(file_path: str) -> pd.DataFrame:
                 for t_idx, region in enumerate(regions):
                     df_table = _extract_formatted_table(sheet_val, sheet_fmt, region)
                     if not df_table.empty:
+                        sr, er, sc, ec = region
+                        excel_range = f"{_col_letter(sc - 1)}{sr}:{_col_letter(ec - 1)}{er}"
                         df_table["__sheet__"] = sheet_name
                         df_table["__table__"] = t_idx + 1
+                        df_table["__excel_name__"] = Path(file_path).name
+                        df_table["__range__"] = excel_range
                         all_frames.append(df_table)
-                        log.info("    Table %d: %d rows x %d cols", t_idx + 1, *df_table.shape)
+                        log.info("    Table %d: %d rows x %d cols  range=%s", t_idx + 1, *df_table.shape, excel_range)
             else:
                 log.info("  -> No formatted tables; using fallback block detection")
                 df_raw = pd.read_excel(file_path, sheet_name=sheet_name, engine="openpyxl", header=None)
@@ -557,6 +561,8 @@ def load_data(file_path: str) -> pd.DataFrame:
                             if not df_block.empty:
                                 df_block["__sheet__"] = sheet_name
                                 df_block["__table__"] = t_idx + 1
+                                df_block["__excel_name__"] = Path(file_path).name
+                                df_block["__range__"] = rng
                                 all_frames.append(df_block)
                                 log.info("    Fallback table %d (%s): %d rows x %d cols", t_idx + 1, rng, *df_block.shape)
                         except Exception as exc:
@@ -567,6 +573,8 @@ def load_data(file_path: str) -> pd.DataFrame:
                     if not df_raw.empty:
                         df_raw["__sheet__"] = sheet_name
                         df_raw["__table__"] = 1
+                        df_raw["__excel_name__"] = Path(file_path).name
+                        df_raw["__range__"] = "A1:full-sheet"
                         all_frames.append(df_raw)
                         log.info("    Whole-sheet fallback: %d rows x %d cols", *df_raw.shape)
 
@@ -587,6 +595,8 @@ def load_data(file_path: str) -> pd.DataFrame:
                         if not df_block.empty:
                             df_block["__sheet__"] = sheet_name
                             df_block["__table__"] = t_idx + 1
+                            df_block["__excel_name__"] = Path(file_path).name
+                            df_block["__range__"] = rng
                             all_frames.append(df_block)
                     except Exception as exc:
                         log.warning("    Range %s failed: %s", rng, exc)
@@ -596,6 +606,8 @@ def load_data(file_path: str) -> pd.DataFrame:
                 if not df_raw.empty:
                     df_raw["__sheet__"] = sheet_name
                     df_raw["__table__"] = 1
+                    df_raw["__excel_name__"] = Path(file_path).name
+                    df_raw["__range__"] = "A1:full-sheet"
                     all_frames.append(df_raw)
 
     if not all_frames:
