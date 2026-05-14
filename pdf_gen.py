@@ -47,7 +47,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
-from preprocess_file import load_data, detect_numeric_columns, _build_styles
+from preprocessnew import load_data, detect_numeric_columns, _build_styles
 
 #-----PDF GENERATION MODULE -------#
 
@@ -133,7 +133,7 @@ class PDFGenerationReport:
         - Return ONLY a valid JSON array of exactly 10 section IDs.
         - Choose sections genuinely applicable to this data.
         - Avoid sections clearly irrelevant (e.g. geographic_analysis if no location columns).
-        - Always include executive_summary and strategic_recommendations.
+        - Always include executive_summary, strategic_recommendations, and key_questions.
         - Return NO prose, NO markdown, NO explanation — only the JSON array.
     """)
 
@@ -648,6 +648,7 @@ class PDFGenerationReport:
             "trend_analysis", "correlation_analysis", "outlier_detection",
             "distribution_analysis", "kpi_analysis", "strategic_recommendations", "key_questions",
         ]
+        MANDATORY = {"executive_summary", "strategic_recommendations", "key_questions"}
         known = {s["id"] for s in self.SECTION_CATALOGUE}
         match = re.search(r"\[.*?\]", raw, re.DOTALL)
 
@@ -657,13 +658,27 @@ class PDFGenerationReport:
 
         try:
             ids = json.loads(match.group())
-            ids = list(dict.fromkeys(i for i in ids if i in known))[:10]
+            ids = list(dict.fromkeys(i for i in ids if i in known))
+
+            # Ensure all mandatory sections are present
+            for m_id in MANDATORY:
+                if m_id not in ids:
+                    ids.insert(0, m_id)
+
+            # Trim to 10 while preserving mandatory sections
+            if len(ids) > 10:
+                non_mandatory = [i for i in ids if i not in MANDATORY]
+                mandatory_in_ids = [i for i in ids if i in MANDATORY]
+                ids = mandatory_in_ids + non_mandatory[:10 - len(mandatory_in_ids)]
+
+            # Pad to exactly 10 using defaults if needed
             while len(ids) < 10:
                 for d in defaults:
                     if d not in ids:
                         ids.append(d)
                     if len(ids) == 10:
                         break
+
             log.info("Selected sections: %s", ids)
             return ids
         except json.JSONDecodeError:
@@ -1304,45 +1319,57 @@ class PDFGenerationReport:
 
     def _gen_key_questions(self, a: dict) -> str:
         """
-        Generates data-specific strategic questions for the PDF report.
+        Generates sample questions for the PDF report.
 
-        This method builds a grounded context from the dataset analysis results,
-        including column names, numeric means, top correlations, and missing-value
-        summaries. It then asks the LLM to generate questions that are tied directly
-        to the actual dataset structure and values.
-
-        Args:
-            a (dict): Analysis dictionary containing dataset metadata and summaries.
-                Expected keys include:
-                - "columns": List of dataset column names.
-                - "numeric_means": Mean values for numeric columns.
-                - "strong_correlations": Ranked list of strong column correlations.
-                - "missing_summary": Missing-value summary by column.
+        The questions are grounded in actual Excel table columns and dataset profile.
+        They are question-only prompts intended for users to answer by inspecting,
+        filtering, comparing, counting, summing, averaging, ranking, or calculating
+        values from the Excel table.
 
         Returns:
-            str: Ten specific dataset-related questions, or a message indicating
-            insufficient data if meaningful questions cannot be generated.
+            str: Dataset-specific sample questions with no answers.
         """
         grounded = {
-            "columns": a["columns"],
-            "numeric_means": a["numeric_means"],
-            "strong_correlations": a["strong_correlations"][:5],
-            "missing_summary": a["missing_summary"],
+            "columns": a["columns"], "numeric_means": a["numeric_means"], "strong_correlations": a["strong_correlations"][:5], "missing_summary": a["missing_summary"],
+          
         }
+
         task = """
-            Generate 10 specific questions based on actual columns and values.
+            Generate sample questions for this Excel table for my chatbot which answers of question based on provided excel table.
 
-            Rules:
-            - Each question must reference a column name
-            - No generic business questions
-            - Keep each under 15 words
+            Requirements:
+            - Minimum 10 questions.
+            - Decide the final number of questions based on dataset richness.
+            - Questions only; no answers.
+            - Number the questions.
+            - Each question must reference actual column names where possible.
+            - Do not include actual numerical answers in the questions.
+            - Frame many questions so the answer requires a numerical lookup, calculation, comparison, count, sum, average, minimum, maximum, percentage, or ranking from the Excel table.
+            - Use the dataset profile only to understand what question types are possible.
+            - Do not expose computed statistics directly in the question.
+            - Do not ask questions that cannot be answered from the Excel table.
+            - Do not force question types unsupported by the data.
+            - Avoid repeating the same question pattern.
 
-            If insufficient data:
-            "Insufficient data for questions"
+            Include a balanced mix of applicable question types:
+            1. Count-based questions
+            2. Sum or total questions
+            3. Average or mean questions
+            4. Minimum and maximum questions
+            5. Ranking questions
+            6. Category-wise comparison questions
+            7. Percentage or proportion questions
+            8. Missing value lookup questions
+            10. Outlier   lookup questions
+            11. Correlation or relationship questions
+            12. Time/date trend questions
+            14. Filtered numerical lookup questions, where the user can calculate a numeric value after filtering by a category, region, product, customer, date, or segment
+
         """
+
         return self.llm_narrative(
-            "senior analyst",
-         task, 
+            "expert Excel report assistant",
+            task,
             grounded,
         )
 
@@ -1514,7 +1541,7 @@ class PDFGenerationReport:
 if __name__ == "__main__":
     start = time.time()
 
-    input_path = Path("AdventureWorks Sales.xlsx")
+    input_path = Path("Financial Sample-3.xlsx")
     output_path = input_path.with_suffix(".pdf")
 
     df = load_data(str(input_path))
