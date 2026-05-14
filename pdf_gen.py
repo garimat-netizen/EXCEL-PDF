@@ -47,7 +47,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger(__name__)
-from preprocessnew import load_data, detect_numeric_columns, _build_styles
+from preprocess_file  import load_data, detect_numeric_columns, _build_styles
 
 #-----PDF GENERATION MODULE -------#
 
