@@ -733,9 +733,7 @@ def load_data(file_path: str) -> pd.DataFrame:
     if not all_frames:
        raise ValueError("No data could be extracted from the workbook.")
 
-# Fix duplicate column names before combining extracted tables.
-# This prevents:
-# pandas.errors.InvalidIndexError: Reindexing only valid with uniquely valued Index objects
+
     clean_frames = []
 
     for i, frame in enumerate(all_frames):
